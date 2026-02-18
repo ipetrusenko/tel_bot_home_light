@@ -6,29 +6,24 @@ import paho.mqtt.client as mqtt
 import os
 from dotenv import load_dotenv
 
-# 1. Завантажуємо секрети з .env
+# Configuration
 load_dotenv()
-
-# --- КОНФІГУРАЦІЯ ---
 TOKEN = os.getenv('BOT_TOKEN')
-
-# Хитрість: беремо рядок "123,456" і робимо з нього список чисел
 users_str = os.getenv('ALLOWED_USERS', '')
 ALLOWED_USERS = [int(u) for u in users_str.split(',') if u.strip().isdigit()]
 
-# MQTT (VPS)
+# MQTT connection
 MQTT_BROKER = os.getenv('MQTT_BROKER')
 MQTT_PORT = int(os.getenv('MQTT_PORT', 1883))
 MQTT_USER = os.getenv('MQTT_USER')
 MQTT_PASS = os.getenv('MQTT_PASS')
 MQTT_TOPIC = "home/light/+"
 
-# Arduino
+# Arduino connection
 SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
 BAUD_RATE = 9600
 
-# --- СТАН СИСТЕМИ (ВИПРАВЛЕНО) ---
-# Тут ми просто зберігаємо стани пінів
+# Arduino pin statuses
 led_states = {
     13: 0,  # Кухня
     12: 0,  # Ванна
@@ -36,12 +31,12 @@ led_states = {
     9: 0    # Кімната
 }
 
-# --- ПІДКЛЮЧЕННЯ ДО ARDUINO ---
+# trying to connect Arduino
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(2)
     print("✅ Arduino підключено!")
-    # Скидаємо в 0 при старті
+    # Set 0 for led stripes
     for pin in led_states:
         ser.write(f"{pin} 0".encode('utf-8'))
         time.sleep(0.05)
@@ -49,11 +44,10 @@ except Exception as e:
     print(f"❌ Помилка Arduino: {e}")
     ser = None
 
-# Ініціалізація бота
+# Start TG bot
 bot = telebot.TeleBot(TOKEN)
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-# --- ФУНКЦІЯ ВИКОНАННЯ КОМАНДИ ---
 def execute_command(pin, state, source="Unknown", mqtt_sender=None):
     try:
         led_states[pin] = int(state)
@@ -77,7 +71,7 @@ def execute_command(pin, state, source="Unknown", mqtt_sender=None):
         print(f"❌ Помилка виконання: {e}")
         return False
 
-# --- MQTT ЛОГІКА ---
+# MQTT Logic
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print("✅ Підключено до MQTT (VPS)")
@@ -107,7 +101,7 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 
-# --- TELEGRAM ЛОГІКА ---
+# TELEGRAM Logic
 def main_menu():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton('🍳 Кухня')
@@ -132,18 +126,17 @@ def handle_messages(message):
     pin = None
     name = ""
 
-    # --- ТУТ МИ ВИПРАВИЛИ ЛОГІКУ ---
     if msg == '🍳 Кухня':
-        pin = 13  # Тепер це 13
+        pin = 13
         name = "Кухня"
     elif msg == '🛁 Ванна':
-        pin = 12  # Залишилось 12
+        pin = 12
         name = "Ванна"
     elif msg == '🚽 Туалет':
-        pin = 8   # Тепер це 8
+        pin = 8
         name = "Туалет"
     elif msg == '🛏 Кімната':
-        pin = 9   # Тепер це 9
+        pin = 9
         name = "Кімната"
 
     if pin:
@@ -156,7 +149,6 @@ def handle_messages(message):
         else:
             bot.reply_to(message, "Помилка зв'язку")
 
-# --- ЗАПУСК ---
 if __name__ == "__main__":
     print("🚀 Запускаю систему...")
 
