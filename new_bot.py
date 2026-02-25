@@ -4,6 +4,8 @@ import serial
 import time
 import paho.mqtt.client as mqtt
 import os
+import signal
+import sys
 from dotenv import load_dotenv
 
 # Configuration
@@ -17,26 +19,19 @@ MQTT_BROKER = os.getenv('MQTT_BROKER')
 MQTT_PORT = int(os.getenv('MQTT_PORT', 1883))
 MQTT_USER = os.getenv('MQTT_USER')
 MQTT_PASS = os.getenv('MQTT_PASS')
-MQTT_TOPIC = "home/light/+"
+# Топік для команд: home/light/13, home/light/12 і т.д.
+MQTT_COMMAND_TOPIC = "home/light/+" 
 
 # Arduino connection
 SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
 BAUD_RATE = 9600
 
-# Arduino pin statuses
-led_states = {
-    13: 0,  # Кухня
-    12: 0,  # Ванна
-    8: 0,   # Туалет
-    9: 0    # Кімната
-}
+led_states = {13: 0, 12: 0, 8: 0, 9: 0}
 
-# trying to connect Arduino
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(2)
     print("✅ Arduino підключено!")
-    # Set 0 for led stripes
     for pin in led_states:
         ser.write(f"{pin} 0".encode('utf-8'))
         time.sleep(0.05)
@@ -44,25 +39,21 @@ except Exception as e:
     print(f"❌ Помилка Arduino: {e}")
     ser = None
 
-# Start TG bot
 bot = telebot.TeleBot(TOKEN)
+# Використовуємо CallbackAPIVersion.VERSION2 для сумісності з новим paho-mqtt
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-def execute_command(pin, state, source="Unknown", mqtt_sender=None):
+def execute_command(pin, state, source="Unknown"):
     try:
         led_states[pin] = int(state)
         if ser and ser.is_open:
             command = f"{pin} {state}"
             ser.write(command.encode('utf-8'))
             print(f"🔌 [{source}] Виконано: {command}")
+            
+            # Відправляємо статус назад в MQTT (це бачитиме n8n)
             status_topic = f"home/light/{pin}/status"
-            client_to_use = mqtt_sender if mqtt_sender else mqtt_client
-            try:
-                client_to_use.publish(status_topic, state, retain=True)
-                print(f"📡 Статус відправлено в: {status_topic}")
-            except Exception as ex:
-                print(f"⚠️ Не вдалося відправити статус: {ex}")
-
+            mqtt_client.publish(status_topic, state, retain=True)
             return True
         else:
             print("⚠️ Arduino недоступна")
@@ -71,92 +62,89 @@ def execute_command(pin, state, source="Unknown", mqtt_sender=None):
         print(f"❌ Помилка виконання: {e}")
         return False
 
-# MQTT Logic
+# --- MQTT Logic ---
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        print("✅ Підключено до MQTT (VPS)")
-        client.subscribe(MQTT_TOPIC)
+        print(f"✅ Підключено до MQTT Брокера ({MQTT_BROKER})")
+        # Підписуємось саме тут, щоб при розриві зв'язку підписка поновилася
+        client.subscribe(MQTT_COMMAND_TOPIC)
+        print(f"📡 Підписано на топік: {MQTT_COMMAND_TOPIC}")
     else:
-        print(f"❌ MQTT помилка: {rc}")
+        print(f"❌ Помилка підключення, код: {rc}")
 
 def on_message(client, userdata, msg):
     try:
-        payload = msg.payload.decode().strip()
         topic = msg.topic
-        if "status" in topic: return
-        if payload not in ['0', '1']: return
+        payload = msg.payload.decode().strip()
+        
+        # Ігноруємо топіки статусів, щоб не було нескінченного циклу
+        if "status" in topic:
+            return
 
-        state = int(payload)
-        try:
-            pin = int(topic.split("/")[-1])
-        except: return
+        print(f"📩 Отримано MQTT: {topic} -> {payload}")
 
-        if pin in led_states:
-            execute_command(pin, state, source="MQTT/n8n", mqtt_sender=client)
-
+        if payload in ['0', '1']:
+            # Витягуємо номер піна з топіка (останнє число)
+            try:
+                pin = int(topic.split("/")[-1])
+                if pin in led_states:
+                    # Виконуємо команду, якщо стан змінився
+                    if led_states[pin] != int(payload):
+                        execute_command(pin, payload, source="MQTT/n8n")
+            except ValueError:
+                pass
     except Exception as e:
-        print(f"❌ MQTT Error: {e}")
+        print(f"❌ Помилка обробки MQTT повідомлення: {e}")
 
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 
-# TELEGRAM Logic
+# --- Graceful Shutdown ---
+def signal_handler(sig, frame):
+    print('\n🛑 Зупинка системи...')
+    if ser: ser.close()
+    mqtt_client.loop_stop()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# --- Telegram Logic ---
+# (Твій блок меню та обробники повідомлень залишаються без змін)
 def main_menu():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    btn1 = types.KeyboardButton('🍳 Кухня')
-    btn2 = types.KeyboardButton('🛁 Ванна')
-    btn3 = types.KeyboardButton('🚽 Туалет')
-    btn4 = types.KeyboardButton('🛏 Кімната')
+    btn1, btn2, btn3, btn4 = [types.KeyboardButton(x) for x in ['🍳 Кухня', '🛁 Ванна', '🚽 Туалет', '🛏 Кімната']]
     markup.add(btn1, btn2, btn3, btn4)
     return markup
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
     if message.from_user.id in ALLOWED_USERS:
-        bot.reply_to(message, "Піни перепризначено! Керуй.", reply_markup=main_menu())
+        bot.reply_to(message, "Система готова. Керуй світлом:", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda message: True)
 def handle_messages(message):
-    user_id = message.from_user.id
-    if user_id not in ALLOWED_USERS:
-        return
-
-    msg = message.text
-    pin = None
-    name = ""
-
-    if msg == '🍳 Кухня':
-        pin = 13
-        name = "Кухня"
-    elif msg == '🛁 Ванна':
-        pin = 12
-        name = "Ванна"
-    elif msg == '🚽 Туалет':
-        pin = 8
-        name = "Туалет"
-    elif msg == '🛏 Кімната':
-        pin = 9
-        name = "Кімната"
-
-    if pin:
-        current_state = led_states[pin]
-        new_state = 1 if current_state == 0 else 0
-        success = execute_command(pin, new_state, source="Telegram")
-        status_text = "УВІМКНЕНО 💡" if new_state else "ВИМКНЕНО 🌑"
-        if success:
-            bot.reply_to(message, f"{name}: {status_text}")
-        else:
-            bot.reply_to(message, "Помилка зв'язку")
+    if message.from_user.id not in ALLOWED_USERS: return
+    
+    mapping = {'🍳 Кухня': 13, '🛁 Ванна': 12, '🚽 Туалет': 8, '🛏 Кімната': 9}
+    msg_text = message.text
+    
+    if msg_text in mapping:
+        pin = mapping[msg_text]
+        new_state = 1 if led_states[pin] == 0 else 0
+        if execute_command(pin, new_state, source="Telegram"):
+            status = "УВІМКНЕНО 💡" if new_state else "ВИМКНЕНО 🌑"
+            bot.reply_to(message, f"{msg_text}: {status}")
 
 if __name__ == "__main__":
-    print("🚀 Запускаю систему...")
-
+    print("🚀 Запуск систем...")
+    
     try:
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        # loop_start запускає фоновий потік для MQTT, що дозволяє боту працювати паралельно
         mqtt_client.loop_start() 
     except Exception as e:
-        print(f"⚠️ MQTT помилка: {e}")
+        print(f"⚠️ Помилка старту MQTT: {e}")
 
-    print("🤖 Бот слухає...")
+    print("🤖 Бот активований...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
